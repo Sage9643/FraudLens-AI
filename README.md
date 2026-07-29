@@ -6,39 +6,26 @@
 
 
 <p align="center">
-  <a href="https://your-vercel-url.vercel.app">
-    <img src="https://img.shields.io/badge/🚀_Live_Demo-Visit_App-4CAF50?style=for-the-badge" />
-  </a>
-  <a href="https://your-render-url.onrender.com/docs">
-    <img src="https://img.shields.io/badge/📖_API-Documentation-009688?style=for-the-badge" />
-  </a>
-  <a href="https://github.com/YOUR_USERNAME/FraudLens-AI">
-    <img src="https://img.shields.io/badge/💻_Source_Code-GitHub-181717?style=for-the-badge&logo=github" />
-  </a>
-</p>
 
-<p align="center">
+<img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=white"/>
 
-<img src="https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=white"/>
+<img src="https://img.shields.io/badge/FastAPI-Backend-009688?style=flat-square&logo=fastapi&logoColor=white"/>
 
-<img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white"/>
+<img src="https://img.shields.io/badge/XGBoost-ML-orange?style=flat-square"/>
 
-<img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
+<img src="https://img.shields.io/badge/SHAP-XAI-purple?style=flat-square"/>
 
-<img src="https://img.shields.io/badge/Tailwind-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white"/>
+<img src="https://img.shields.io/badge/SQLite-Database-003B57?style=flat-square&logo=sqlite&logoColor=white"/>
 
-<img src="https://img.shields.io/badge/XGBoost-FF7F0E?style=for-the-badge"/>
+<img src="https://img.shields.io/badge/Tailwind-CSS-38BDF8?style=flat-square&logo=tailwindcss&logoColor=white"/>
 
-<img src="https://img.shields.io/badge/SHAP-7B1FA2?style=for-the-badge"/>
+<img src="https://img.shields.io/badge/Vercel-Frontend-black?style=flat-square&logo=vercel"/>
 
-<img src="https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white"/>
+<img src="https://img.shields.io/badge/Render-Backend-46E3B7?style=flat-square&logo=render&logoColor=black"/>
 
-<img src="https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel"/>
-
-<img src="https://img.shields.io/badge/Render-46E3B7?style=for-the-badge&logo=render&logoColor=black"/>
+<img src="https://img.shields.io/badge/Status-Production_Ready-brightgreen?style=flat-square"/>
 
 </p>
-
 ---
 
 
