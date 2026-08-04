@@ -23,7 +23,7 @@
 
 <img src="https://img.shields.io/badge/Render-Backend-46E3B7?style=flat-square&logo=render&logoColor=black"/>
 
-<img src="https://img.shields.io/badge/Status-Production_Ready-brightgreen?style=flat-square"/>
+
 
 </p>
 ---
