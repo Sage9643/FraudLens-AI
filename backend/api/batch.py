@@ -6,6 +6,7 @@ entirely to batch_service. No pandas/model logic lives here.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -27,15 +28,22 @@ async def predict_batch(file: UploadFile = File(...)) -> BatchPredictResponse:
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
 
-    file_bytes = await file.read()
-    if len(file_bytes) > settings.max_upload_size_bytes:
+    # Determine upload size without reading the file into memory: seek to
+    # the end of the underlying SpooledTemporaryFile, read the offset, then
+    # rewind. O(1), no copy - replaces the old `await file.read()` which
+    # held the entire upload as a `bytes` object for the rest of the request.
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
+    file.file.seek(0)
+
+    if file_size > settings.max_upload_size_bytes:
         raise HTTPException(
             status_code=400,
             detail=f"File exceeds the maximum upload size of {settings.max_upload_size_mb} MB.",
         )
 
     try:
-        result = score_batch(file_bytes, model_service)
+        result = score_batch(file, model_service)
     except InvalidTransactionError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc
 

@@ -14,26 +14,33 @@ separate, ephemeral-on-disk concern by design.
 Performance note (why this file looks different from a naive per-row loop):
 the original implementation constructed one TransactionRequest (pydantic
 validation), one single-row DataFrame, one scaler.transform() call, and one
-model.predict_proba() call PER ROW. For the ~285k-row Kaggle dataset that is
-~285k Python object constructions and ~285k separate calls into pandas/
-XGBoost, each carrying fixed per-call overhead - the overhead dominates, not
-the actual math. Scoring is now done with exactly one scaler.transform()
-call and one model.predict_proba() call for the entire file, via
-prediction_service.predict_fraud_probabilities(). Risk classification still
-calls risk_service.classify_risk() once per row (unchanged, reused as-is)
-because that function is cheap (a few float comparisons and a dict lookup) -
-it was never the bottleneck, so it does not need to change.
+model.predict_proba() call PER ROW. Scoring is done with one
+scaler.transform() call and one model.predict_proba() call PER CHUNK (see
+below), via prediction_service.predict_fraud_probabilities(). Risk
+classification still calls risk_service.classify_risk() once per row
+(unchanged, reused as-is) because that function is cheap.
+
+Memory note (Sprint: Render OOM fix): the previous implementation read the
+entire upload into a `bytes` object, parsed it into one full-file DataFrame,
+and built a second full-file output DataFrame with 5 extra columns - several
+complete in-memory copies of the file alive simultaneously. For a large CSV
+(e.g. the ~285k-row / ~150MB Kaggle dataset) this comfortably exceeded
+Render's 512MB limit. This version streams the upload with
+`pandas.read_csv(..., chunksize=...)` and appends each scored chunk directly
+to the output CSV on disk, so memory usage is bounded by one chunk (~10k
+rows) at a time regardless of the total file size.
 """
 from __future__ import annotations
 
 import time
 import uuid
 from datetime import datetime, timezone
-from io import BytesIO
+from io import TextIOWrapper
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from fastapi import UploadFile
 
 from database import batch_crud
 from database.db import get_connection
@@ -53,6 +60,8 @@ OUTPUT_COLUMNS = REQUIRED_COLUMNS + [
     "recommended_action",
 ]
 
+CHUNK_SIZE = 10_000
+
 
 def _ensure_output_dir() -> Path:
     output_dir = get_settings().batch_output_path
@@ -60,95 +69,152 @@ def _ensure_output_dir() -> Path:
     return output_dir
 
 
-def _validate_csv(df: pd.DataFrame) -> None:
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+def _validate_header(columns: list[str]) -> None:
+    missing = [col for col in REQUIRED_COLUMNS if col not in columns]
     if missing:
         raise InvalidTransactionError(f"CSV is missing required column(s): {', '.join(missing)}")
 
-    if len(df) == 0:
-        raise InvalidTransactionError("CSV contains no data rows.")
 
-    max_rows = get_settings().max_batch_rows
-    if len(df) > max_rows:
-        raise InvalidTransactionError(
-            f"CSV contains {len(df)} rows, exceeding the maximum of {max_rows}."
-        )
-
-    # Vectorized numeric check (column-wise, not a Python loop over rows).
-    numeric_view = df[REQUIRED_COLUMNS].apply(pd.to_numeric, errors="coerce")
+def _validate_chunk_values(chunk: pd.DataFrame, running_bad_numeric: list[int], running_bad_amount: list[int]) -> None:
+    """Accumulates non-numeric / negative-Amount counts across chunks so the
+    error message matches the original whole-file semantics (it doesn't stop
+    at the first offending chunk)."""
+    numeric_view = chunk[REQUIRED_COLUMNS].apply(pd.to_numeric, errors="coerce")
     non_numeric = numeric_view.isna()
     if non_numeric.any().any():
-        bad_rows = int(non_numeric.any(axis=1).sum())
-        raise InvalidTransactionError(
-            f"CSV contains non-numeric values in one or more required columns "
-            f"(affects {bad_rows} row(s))."
-        )
+        running_bad_numeric[0] += int(non_numeric.any(axis=1).sum())
 
-    # Mirrors TransactionRequest's Amount >= 0 constraint (the same rule the
-    # single-transaction /api/predict endpoint enforces via Pydantic), applied
-    # vectorized instead of via per-row model construction.
     negative_amounts = numeric_view["Amount"] < 0
     if negative_amounts.any():
-        bad_count = int(negative_amounts.sum())
-        raise InvalidTransactionError(
-            f"CSV contains {bad_count} row(s) with a negative Amount value."
-        )
+        running_bad_amount[0] += int(negative_amounts.sum())
 
 
-def score_batch(file_bytes: bytes, model_service: ModelService) -> dict:
+def score_batch(file: UploadFile, model_service: ModelService) -> dict:
     start = time.monotonic()
-
-    try:
-        df = pd.read_csv(BytesIO(file_bytes))
-    except Exception as exc:  # noqa: BLE001
-        raise InvalidTransactionError(f"Could not parse CSV: {exc}") from exc
-
-    _validate_csv(df)
+    settings = get_settings()
+    max_rows = settings.max_batch_rows
 
     metadata = model_service.get_metadata()
     risk_bands = metadata["risk_bands"]
     threshold = metadata["decision_threshold"]
 
-    features_df = df[REQUIRED_COLUMNS]
-
-    # One vectorized scoring pass for the entire file - see module docstring.
-    probabilities = predict_fraud_probabilities(features_df, model_service)
-
-    predictions = np.where(probabilities >= threshold, "Fraudulent", "Legitimate")
-    confidences = np.maximum(probabilities, 1 - probabilities)
-
-    # classify_risk is reused exactly as /api/predict uses it - unchanged,
-    # not reimplemented. It is cheap enough (float comparisons + dict
-    # lookups) that a plain Python loop over ~285k rows is not the
-    # bottleneck; the bottleneck was always the per-row model/scaler calls
-    # eliminated above.
-    risk_band_values: list[str] = [None] * len(probabilities)
-    recommended_actions: list[str] = [None] * len(probabilities)
-    for i, probability in enumerate(probabilities):
-        risk = classify_risk(float(probability), risk_bands)
-        risk_band_values[i] = risk.risk_band
-        recommended_actions[i] = risk.recommended_action
-
-    df["prediction"] = predictions
-    df["fraud_probability"] = np.round(probabilities, 6)
-    df["confidence"] = np.round(confidences, 6)
-    df["risk_band"] = risk_band_values
-    df["recommended_action"] = recommended_actions
-
-    rows_scored = len(df)
-    fraud_count = int(np.count_nonzero(predictions == "Fraudulent"))
-    fraud_rate = round(fraud_count / rows_scored, 6) if rows_scored else 0.0
-
-    risk_band_series = df["risk_band"]
-    risk_distribution = [
-        {"risk_band": band, "count": int((risk_band_series == band).sum())}
-        for band in risk_bands["actions"].keys()
-    ]
-
     batch_id = uuid.uuid4().hex
     output_dir = _ensure_output_dir()
     file_path = output_dir / f"{batch_id}.csv"
-    df[OUTPUT_COLUMNS].to_csv(file_path, index=False)
+
+    # Wrap the UploadFile's underlying binary stream as text so pandas can
+    # read it directly, without ever materializing the whole upload as a
+    # `bytes` object. detach() (not close()) in `finally` disconnects this
+    # wrapper from the stream without closing it, since Starlette owns the
+    # UploadFile's lifecycle.
+    text_stream = TextIOWrapper(file.file, encoding="utf-8")
+
+    rows_scored = 0
+    fraud_count = 0
+    risk_band_counts = {band: 0 for band in risk_bands["actions"].keys()}
+    running_bad_numeric = [0]
+    running_bad_amount = [0]
+    header_written = False
+
+    try:
+        # Cheap header/empty-file pre-check before touching any data rows,
+        # so missing-column and empty-file errors take precedence exactly as
+        # the original whole-file validation did.
+        header_df = pd.read_csv(text_stream, nrows=0)
+        _validate_header(list(header_df.columns))
+        text_stream.seek(0)
+
+        try:
+            reader = pd.read_csv(text_stream, chunksize=CHUNK_SIZE)
+        except Exception as exc:  # noqa: BLE001
+            raise InvalidTransactionError(f"Could not parse CSV: {exc}") from exc
+
+        for chunk in reader:
+            if len(chunk) == 0:
+                continue
+
+            _validate_chunk_values(chunk, running_bad_numeric, running_bad_amount)
+
+            # Row-limit check: deliberate early-exit rather than an exact
+            # whole-file count, so an oversized file is rejected without
+            # fully processing it first (which would defeat the point of
+            # the limit).
+            if rows_scored + len(chunk) > max_rows:
+                raise InvalidTransactionError(
+                    f"CSV exceeds the maximum of {max_rows} rows."
+                )
+
+            if running_bad_numeric[0] or running_bad_amount[0]:
+                # Keep validating subsequent chunks to accumulate accurate
+                # counts (matching original whole-file semantics), but never
+                # score or write a chunk once a validation error is known.
+                continue
+
+            features_df = chunk[REQUIRED_COLUMNS]
+            probabilities = predict_fraud_probabilities(features_df, model_service)
+
+            predictions = np.where(probabilities >= threshold, "Fraudulent", "Legitimate")
+            confidences = np.maximum(probabilities, 1 - probabilities)
+
+            risk_band_values: list[str] = [None] * len(probabilities)
+            recommended_actions: list[str] = [None] * len(probabilities)
+            for i, probability in enumerate(probabilities):
+                risk = classify_risk(float(probability), risk_bands)
+                risk_band_values[i] = risk.risk_band
+                recommended_actions[i] = risk.recommended_action
+                risk_band_counts[risk.risk_band] += 1
+
+            chunk = chunk.copy()
+            chunk["prediction"] = predictions
+            chunk["fraud_probability"] = np.round(probabilities, 6)
+            chunk["confidence"] = np.round(confidences, 6)
+            chunk["risk_band"] = risk_band_values
+            chunk["recommended_action"] = recommended_actions
+
+            chunk[OUTPUT_COLUMNS].to_csv(
+                file_path, mode="a", header=not header_written, index=False
+            )
+            header_written = True
+
+            rows_scored += len(chunk)
+            fraud_count += int(np.count_nonzero(predictions == "Fraudulent"))
+
+        # Now that the whole file has been scanned, raise with the
+        # accumulated counts if any validation errors were found - matching
+        # the original whole-file error semantics.
+        if running_bad_numeric[0]:
+            raise InvalidTransactionError(
+                f"CSV contains non-numeric values in one or more required columns "
+                f"(affects {running_bad_numeric[0]} row(s))."
+            )
+        if running_bad_amount[0]:
+            raise InvalidTransactionError(
+                f"CSV contains {running_bad_amount[0]} row(s) with a negative Amount value."
+            )
+
+        if rows_scored == 0:
+            raise InvalidTransactionError("CSV contains no data rows.")
+
+    except InvalidTransactionError:
+        file_path.unlink(missing_ok=True)
+        raise
+    except pd.errors.ParserError as exc:
+        file_path.unlink(missing_ok=True)
+        raise InvalidTransactionError(f"Could not parse CSV: {exc}") from exc
+    except Exception:
+        # Any other unexpected failure must not leave a partially-written
+        # output file behind.
+        file_path.unlink(missing_ok=True)
+        raise
+    finally:
+        # Disconnects the text wrapper without closing Starlette's
+        # underlying upload stream.
+        text_stream.detach()
+
+    fraud_rate = round(fraud_count / rows_scored, 6) if rows_scored else 0.0
+    risk_distribution = [
+        {"risk_band": band, "count": count} for band, count in risk_band_counts.items()
+    ]
 
     processing_time_ms = int((time.monotonic() - start) * 1000)
     created_at = datetime.now(timezone.utc).isoformat()
